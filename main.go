@@ -4,10 +4,6 @@ package main
 
 TODO
 
-- stop checking in InMemoryStore()
-	- checks in the controller, then pass the right value
-	- InMemoryStore should be able to trust the value it takes
-		- a datatype per action?
 - stores in a real DB :-D
 - customize HTTP port
 
@@ -18,7 +14,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 )
 
@@ -42,85 +37,92 @@ func genId() (id Id) {
 
 type Content map[string]interface{}
 
-type Error struct {
-	Code    int
-	Message string
+type CmdInsert struct {
+	Content Content
+	out     chan Content
 }
 
-type ContentOrError struct {
-	Content *Content
-	Error   *Error
+func (c CmdInsert) Action() Action {
+	return INSERT
 }
 
-type Cmd struct {
-	Action  Action
-	Id      *Id
-	Content *Content
-	Out     chan ContentOrError
+func (c CmdInsert) Out() chan Content {
+	return c.out
 }
 
-func InMemoryStore(cmd chan *Cmd) {
-	store := make(map[Id]*Content)
+type CmdSelect struct {
+	Id  Id
+	out chan Content
+}
+
+func (c CmdSelect) Action() Action {
+	return SELECT
+}
+
+func (c CmdSelect) Out() chan Content {
+	return c.out
+}
+
+type CmdUpdate struct {
+	Id      Id
+	Content Content
+	out     chan Content
+}
+
+func (c CmdUpdate) Action() Action {
+	return UPDATE
+}
+
+func (c CmdUpdate) Out() chan Content {
+	return c.out
+}
+
+type Cmd interface {
+	Action() Action
+	Out() chan Content
+}
+
+func InMemoryStore(cmd chan Cmd) {
+	store := make(map[Id]Content)
 	for {
 		c := <-cmd
-		var id *Id
-		switch c.Action {
-		case INSERT:
-			gen := genId()
-			id = &gen
-			fallthrough
-		case UPDATE:
-			if id == nil {
-				id = c.Id
-			}
-			if id == nil {
-				c.Out <- ContentOrError{nil, &Error{400, "Missing id"}}
-				continue
-			}
-			if c.Content == nil {
-				c.Out <- ContentOrError{nil, &Error{400, "Empty content"}}
-				continue
-			}
-			fmt.Printf("Store document at id %v\n", *id)
-			(*c.Content)["id"] = *id
-			store[*id] = c.Content
-			c.Out <- ContentOrError{c.Content, nil}
-		case SELECT:
-			if c.Id == nil {
-				c.Out <- ContentOrError{nil, &Error{400, "Missing id"}}
-				continue
-			}
-			content := store[*c.Id]
-			if content == nil {
-				c.Out <- ContentOrError{nil, &Error{404, fmt.Sprintf("Unknown id: '%v'", *c.Id)}}
-				continue
-			}
-			c.Out <- ContentOrError{content, nil}
+		if cInsert, ok := c.(CmdInsert); ok {
+			id := genId()
+			fmt.Printf("Store document at id %v\n", id)
+			cInsert.Content["id"] = id
+			store[id] = cInsert.Content
+			c.Out() <- cInsert.Content
+			continue
+		}
+		if cUpdate, ok := c.(CmdUpdate); ok {
+			fmt.Printf("Update document at id %v\n", cUpdate.Id)
+			cUpdate.Content["id"] = cUpdate.Id
+			store[cUpdate.Id] = cUpdate.Content
+			c.Out() <- cUpdate.Content
+			continue
+		}
+		if cSelect, ok := c.(CmdSelect); ok {
+			c.Out() <- store[cSelect.Id]
+			continue
 		}
 	}
 }
 
 type JSONHandler struct {
 	Prefix string
-	Cmd    chan *Cmd
+	Cmd    chan Cmd
 }
 
 func (j *JSONHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	out := make(chan ContentOrError)
+	out := make(chan Content)
 	id := Id(strings.TrimPrefix(r.URL.Path, j.Prefix))
 	cId := &id
 	if len(id) == 0 {
 		cId = nil
 	}
-	var content Content
-	var action Action
 	switch r.Method {
 	case "POST":
-		if cId == nil {
-			action = INSERT
-		} else {
-			action = UPDATE
-		}
+		var content Content
 		// parse JSON
 		dec := json.NewDecoder(r.Body)
 		err := dec.Decode(&content)
@@ -129,41 +131,41 @@ func (j *JSONHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "{\"error\":\"Can't parse body\"}\n")
 			return
 		}
+		if cId == nil {
+			j.Cmd <- CmdInsert{content, out}
+		} else {
+			j.Cmd <- CmdUpdate{*cId, content, out}
+		}
 	case "GET":
 		fallthrough
 	default:
-		action = SELECT
+		j.Cmd <- CmdSelect{*cId, out}
 	}
-	j.Cmd <- &Cmd{action, cId, &content, out}
 	res := <-out
-	if res.Error != nil {
-		w.WriteHeader(res.Error.Code)
-		fmt.Fprintf(w, "{\"error\":\"%v\"}\n", res.Error.Message)
+	if res == nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "{\"error\":\"Unknown id: '%v'\"}\n", *cId)
 		return
 	}
 
 	enc := json.NewEncoder(w)
-	enc.Encode(*res.Content)
+	enc.Encode(res)
 }
 
 func main() {
 	prefix := "/json/"
 
-	cmd := make(chan *Cmd)
+	cmd := make(chan Cmd)
 	go InMemoryStore(cmd)
 
 	// initializating of the inMemory DB with fake data
-	out := make(chan ContentOrError)
+	out := make(chan Content)
 	content := Content(map[string]interface{}{
 		"id":   "0",
 		"test": "oui",
 	})
-	cmd <- &Cmd{INSERT, nil, &content, out}
-	res := <-out
-	if res.Error != nil {
-		fmt.Fprintln(os.Stderr, "Error during initialization: ", res.Error)
-		os.Exit(1)
-	}
+	cmd <- CmdInsert{content, out}
+	<-out
 	// -
 
 	http.Handle(prefix, &JSONHandler{prefix, cmd})
