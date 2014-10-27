@@ -5,12 +5,12 @@ package main
 TODO
 
 - stores in a real DB :-D
-- customize HTTP port
 
 */
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -153,6 +153,10 @@ func (j *JSONHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	host := flag.String("h", "127.0.0.1", "The host to bind")
+	port := flag.Int("p", 8080, "The port to listen")
+	flag.Parse()
+
 	prefix := "/json/"
 
 	cmd := make(chan Cmd)
@@ -170,5 +174,7 @@ func main() {
 
 	http.Handle(prefix, &JSONHandler{prefix, cmd})
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	hostPort := fmt.Sprintf("%s:%d", *host, *port)
+
+	log.Fatal(http.ListenAndServe(hostPort, nil))
 }
