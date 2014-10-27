@@ -1,17 +1,11 @@
 package main
 
-/*
-
-TODO
-
-- stores in a real DB :-D
-
-*/
-
 import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 	"log"
 	"net/http"
 	"strings"
@@ -25,14 +19,19 @@ const (
 	UPDATE
 )
 
-type Id string
+type Id struct {
+	s string
+}
 
-var _currentId = 0
+func ParseId(s string) *Id {
+	if len(s) == 0 {
+		return nil
+	}
+	return &Id{s}
+}
 
-func genId() (id Id) {
-	id = Id(fmt.Sprintf("%d", _currentId))
-	_currentId += 1
-	return
+func (id Id) ToObjectId() bson.ObjectId {
+	return bson.ObjectIdHex(id.s)
 }
 
 type Content map[string]interface{}
@@ -82,27 +81,68 @@ type Cmd interface {
 	Out() chan Content
 }
 
-func InMemoryStore(cmd chan Cmd) {
-	store := make(map[Id]Content)
+type MongoConf struct {
+	Host       string
+	Database   string
+	Collection string
+}
+
+type Entry struct {
+	Id      bson.ObjectId `bson:"_id"`
+	Content Content
+}
+
+func CreateInsertEntry(content Content) Entry {
+	id := bson.NewObjectId()
+	return Entry{id, content}
+}
+
+func CreateUpdateEntry(id Id, content Content) Entry {
+	return Entry{id.ToObjectId(), content}
+}
+
+func MongoStore(conf MongoConf, cmd chan Cmd) {
+	session, err := mgo.Dial(conf.Host)
+	if err != nil {
+		panic(err)
+	}
+	defer session.Close()
+	coll := session.DB(conf.Database).C(conf.Collection)
+
 	for {
 		c := <-cmd
 		if cInsert, ok := c.(CmdInsert); ok {
-			id := genId()
-			fmt.Printf("Store document at id %v\n", id)
-			cInsert.Content["id"] = id
-			store[id] = cInsert.Content
-			c.Out() <- cInsert.Content
+			entry := CreateInsertEntry(cInsert.Content)
+			err := coll.Insert(entry)
+			if err != nil {
+				c.Out() <- nil // TODO send a real error
+				continue
+			}
+			entry.Content["id"] = entry.Id
+			c.Out() <- entry.Content
 			continue
 		}
 		if cUpdate, ok := c.(CmdUpdate); ok {
 			fmt.Printf("Update document at id %v\n", cUpdate.Id)
-			cUpdate.Content["id"] = cUpdate.Id
-			store[cUpdate.Id] = cUpdate.Content
-			c.Out() <- cUpdate.Content
+			entry := CreateUpdateEntry(cUpdate.Id, cUpdate.Content)
+			err := coll.UpdateId(entry.Id, entry)
+			if err != nil {
+				c.Out() <- nil // TODO send a real error
+				continue
+			}
+			c.Out() <- entry.Content
 			continue
 		}
 		if cSelect, ok := c.(CmdSelect); ok {
-			c.Out() <- store[cSelect.Id]
+			var entry Entry
+			var id bson.ObjectId = cSelect.Id.ToObjectId()
+			err := coll.FindId(id).One(&entry)
+			if err != nil {
+				c.Out() <- nil // TODO send a real error
+				continue
+			}
+			entry.Content["id"] = entry.Id
+			c.Out() <- entry.Content
 			continue
 		}
 	}
@@ -113,12 +153,22 @@ type JSONHandler struct {
 	Cmd    chan Cmd
 }
 
+func checkId(id *Id) error {
+	if !bson.IsObjectIdHex(id.s) {
+		return fmt.Errorf("Invalid id: '%v'", id.s)
+	}
+	return nil
+}
+
 func (j *JSONHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	out := make(chan Content)
-	id := Id(strings.TrimPrefix(r.URL.Path, j.Prefix))
-	cId := &id
-	if len(id) == 0 {
-		cId = nil
+	id := ParseId(strings.TrimPrefix(r.URL.Path, j.Prefix))
+	if id != nil {
+		if err := checkId(id); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, "{\"error\":\"%v\"}\n", err.Error())
+			return
+		}
 	}
 	switch r.Method {
 	case "POST":
@@ -131,20 +181,25 @@ func (j *JSONHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "{\"error\":\"Can't parse body\"}\n")
 			return
 		}
-		if cId == nil {
+		if id == nil {
 			j.Cmd <- CmdInsert{content, out}
 		} else {
-			j.Cmd <- CmdUpdate{*cId, content, out}
+			j.Cmd <- CmdUpdate{*id, content, out}
 		}
 	case "GET":
 		fallthrough
 	default:
-		j.Cmd <- CmdSelect{*cId, out}
+		if id == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, "{\"error\":\"Missing id\"}\n")
+			return
+		}
+		j.Cmd <- CmdSelect{*id, out}
 	}
 	res := <-out
 	if res == nil {
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, "{\"error\":\"Unknown id: '%v'\"}\n", *cId)
+		fmt.Fprintf(w, "{\"error\":\"Unknown id: '%v'\"}\n", *id)
 		return
 	}
 
@@ -152,29 +207,28 @@ func (j *JSONHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	enc.Encode(res)
 }
 
+type Person struct {
+	Name  string
+	Phone string
+}
+
 func main() {
-	host := flag.String("h", "127.0.0.1", "The host to bind")
-	port := flag.Int("p", 8080, "The port to listen")
+	httpHost := flag.String("h", "127.0.0.1", "The host to bind")
+	httpPort := flag.Int("p", 8080, "The port to listen")
+	mongoHost := flag.String("m", "localhost", "The mongo host(:port) (list)")
+	mongoDatabase := flag.String("d", "jsonstore", "The mongo database")
+	mongoCollection := flag.String("c", "jsons", "The mongo collection")
 	flag.Parse()
 
 	prefix := "/json/"
 
 	cmd := make(chan Cmd)
-	go InMemoryStore(cmd)
-
-	// initializating of the inMemory DB with fake data
-	out := make(chan Content)
-	content := Content(map[string]interface{}{
-		"id":   "0",
-		"test": "oui",
-	})
-	cmd <- CmdInsert{content, out}
-	<-out
-	// -
+	mongoConf := MongoConf{*mongoHost, *mongoDatabase, *mongoCollection}
+	go MongoStore(mongoConf, cmd)
 
 	http.Handle(prefix, &JSONHandler{prefix, cmd})
 
-	hostPort := fmt.Sprintf("%s:%d", *host, *port)
+	hostPort := fmt.Sprintf("%s:%d", *httpHost, *httpPort)
 
 	log.Fatal(http.ListenAndServe(hostPort, nil))
 }
