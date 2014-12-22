@@ -230,6 +230,6 @@ func main() {
 	http.Handle(prefix, &JSONHandler{prefix, cmd})
 
 	hostPort := fmt.Sprintf("%s:%d", *httpHost, *httpPort)
-
+	fmt.Printf("Listen on %v\n", hostPort)
 	log.Fatal(http.ListenAndServe(hostPort, nil))
 }
